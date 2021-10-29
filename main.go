@@ -17,10 +17,12 @@ Copyright 2021 Teodor Spæren
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"runtime/trace"
 	"strings"
 	"sync"
 	"time"
@@ -34,13 +36,34 @@ type EnvDep struct {
 	Prod int
 }
 
-var projectFlag = flag.String("project", "", "selects the project to be used")
+var (
+	projectFlag = flag.String("project", "", "selects the project to be used")
+	traceFlag   = flag.String("trace", "", "file to write trace to")
+)
 
 func main() {
 	flag.Parse()
 	if *projectFlag == "" {
 		log.Fatal("project not set")
 	}
+
+	if *traceFlag != "" {
+		f, err := os.Create(*traceFlag)
+		if err != nil {
+			log.Fatalf("couldn't open trace file: %v", err)
+		}
+		defer f.Close()
+
+		if err := trace.Start(f); err != nil {
+			log.Fatalf("couldn't start trace: %v", err)
+		}
+		defer trace.Stop()
+	}
+
+	ctx := context.Background()
+
+	ctx, tsk := trace.NewTask(ctx, "full-run")
+	defer tsk.End()
 
 	token, ok := os.LookupEnv("GITLAB_TOKEN")
 	if !ok {
@@ -51,24 +74,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("creating client: %v", err)
 	}
-	c = c
 
-	pid, err := getProjectPid(c)
+	pid, err := getProjectID(ctx, c)
 	if err != nil {
-		log.Fatalf("get project pid: %v", err)
+		log.Fatalf("get project id: %v", err)
 	}
 
-	envDeps, err := getEnvs(c, pid)
+	envDeps, err := getEnvs(ctx, c, pid)
 	if err != nil {
 		log.Fatalf("get envs: %v", err)
 	}
 
-	if err := getDrifts(c, pid, envDeps); err != nil {
+	if err := getDrifts(ctx, c, pid, envDeps); err != nil {
 		log.Fatalf("get drifts: %v", err)
 	}
 }
 
-func getDrifts(c *gitlab.Client, pid int, envDeps []EnvDep) error {
+func getDrifts(ctx context.Context, c *gitlab.Client, pid int, envDeps []EnvDep) error {
+	ctx, tsk := trace.NewTask(ctx, "get-drifts")
+	defer tsk.End()
+
 	var wg sync.WaitGroup
 
 	fmt.Printf("SERVICE           | SHORT SHA | LAST DEPLOY\n")
@@ -77,18 +102,23 @@ func getDrifts(c *gitlab.Client, pid int, envDeps []EnvDep) error {
 		go func(ed EnvDep) {
 			defer wg.Done()
 
-			if err := getDrift(c, pid, ed); err != nil {
+			if err := getDrift(ctx, c, pid, ed); err != nil {
 				log.Printf("get drift %s: %v", ed.Name, err)
 			}
 		}(envDep)
 
+		// wg.Wait()
 	}
 
 	wg.Wait()
 	return nil
 }
 
-func getDrift(c *gitlab.Client, pid int, ed EnvDep) error {
+func getDrift(ctx context.Context, c *gitlab.Client, pid int, ed EnvDep) error {
+	ctx, tsk := trace.NewTask(ctx, "get-drift")
+	defer tsk.End()
+
+	trace.Log(ctx, "service", ed.Name)
 	penv, r, err := c.Environments.GetEnvironment(pid, ed.Prod)
 	if err != nil {
 		return fmt.Errorf("get prod environment: %v", err)
@@ -108,7 +138,10 @@ func getDrift(c *gitlab.Client, pid int, ed EnvDep) error {
 	return nil
 }
 
-func getEnvs(c *gitlab.Client, pid int) ([]EnvDep, error) {
+func getEnvs(ctx context.Context, c *gitlab.Client, pid int) ([]EnvDep, error) {
+	ctx, tsk := trace.NewTask(ctx, "get-envs")
+	defer tsk.End()
+
 	page := 1
 	perPage := 20
 
@@ -148,7 +181,10 @@ func getEnvs(c *gitlab.Client, pid int) ([]EnvDep, error) {
 	return servDeps, nil
 }
 
-func getProjectPid(c *gitlab.Client) (int, error) {
+func getProjectID(ctx context.Context, c *gitlab.Client) (int, error) {
+	ctx, tsk := trace.NewTask(ctx, "get-project-id")
+	defer tsk.End()
+
 	ps, r, err := c.Projects.ListProjects(&gitlab.ListProjectsOptions{
 		SearchNamespaces: gitlab.Bool(true),
 		Search:           gitlab.String(*projectFlag),
