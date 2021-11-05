@@ -38,17 +38,21 @@ type EnvDep struct {
 }
 
 type Result struct {
-	name       string
-	sha        string
-	deploy     string
-	deployTime int
+	name     string
+	sha      string
+	deployed time.Time
 }
 
-type ByDate []Result
+type ByLastDeployed []Result
+
+func (a ByLastDeployed) Len() int           { return len(a) }
+func (a ByLastDeployed) Less(i, j int) bool { return a[i].deployed.Before(a[j].deployed) }
+func (a ByLastDeployed) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 
 var (
 	projectFlag = flag.String("project", "", "selects the project to be used")
 	traceFlag   = flag.String("trace", "", "file to write trace to")
+	sortFlag    = flag.String("sort", "deployed", "how to sort the results")
 )
 
 func main() {
@@ -106,9 +110,8 @@ func getDrifts(ctx context.Context, c *gitlab.Client, pid int, envDeps []EnvDep)
 
 	var wg sync.WaitGroup
 
-	var ch = make(chan Result, len(envDeps))
+	ch := make(chan Result, len(envDeps))
 
-	fmt.Printf("SERVICE           | SHORT SHA | LAST DEPLOY\n")
 	for _, envDep := range envDeps {
 		wg.Add(1)
 		go func(ed EnvDep) {
@@ -123,18 +126,25 @@ func getDrifts(ctx context.Context, c *gitlab.Client, pid int, envDeps []EnvDep)
 	wg.Wait()
 	close(ch)
 
-	results := make([]Result, len(envDeps))
-
-	for i := range results {
-		results[i] = <-ch
+	// Collect answers
+	results := make([]Result, 0, len(envDeps))
+	for res := range ch {
+		results = append(results, res)
 	}
 
-	sort.Sort(ByDate(results))
+	switch *sortFlag {
+	case "deployed":
+		sort.Sort(ByLastDeployed(results))
+	case "rev-deployed":
+		sort.Sort(sort.Reverse(ByLastDeployed(results)))
+	default:
+		log.Printf("didn't recognize sort flag: %s", *sortFlag)
+	}
 
+	fmt.Printf("SERVICE           | SHORT SHA | LAST DEPLOY\n")
 	for _, result := range results {
-		if result.name != "" {
-			fmt.Printf("%-18s| %s  | %s\n", result.name, result.sha, result.deploy)
-		}
+		dd := durafmt.Parse(time.Since(result.deployed)).LimitFirstN(2)
+		fmt.Printf("%-18s| %s  | %s\n", result.name, result.sha, dd)
 	}
 
 	return nil
@@ -157,15 +167,11 @@ func getDrift(ctx context.Context, c *gitlab.Client, pid int, ed EnvDep, ch chan
 
 	pdep := penv.LastDeployment.Deployable
 
-	lastDep := time.Since(*pdep.FinishedAt)
-	dd := durafmt.Parse(lastDep).LimitFirstN(2)
-	result := Result{
-		name:       ed.Name,
-		sha:        pdep.Commit.ShortID,
-		deploy:     dd.String(),
-		deployTime: int(dd.Duration()),
+	ch <- Result{
+		name:     ed.Name,
+		sha:      pdep.Commit.ShortID,
+		deployed: *pdep.FinishedAt,
 	}
-	ch <- result
 	return nil
 }
 
@@ -236,7 +242,3 @@ func getProjectID(ctx context.Context, c *gitlab.Client) (int, error) {
 	p := ps[0]
 	return p.ID, nil
 }
-
-func (a ByDate) Len() int           { return len(a) }
-func (a ByDate) Less(i, j int) bool { return a[i].deployTime < a[j].deployTime }
-func (a ByDate) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
