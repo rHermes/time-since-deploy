@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"runtime/trace"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,9 +37,22 @@ type EnvDep struct {
 	Prod int
 }
 
+type Result struct {
+	name     string
+	sha      string
+	deployed time.Time
+}
+
+type ByLastDeployed []Result
+
+func (a ByLastDeployed) Len() int           { return len(a) }
+func (a ByLastDeployed) Less(i, j int) bool { return a[i].deployed.Before(a[j].deployed) }
+func (a ByLastDeployed) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+
 var (
 	projectFlag = flag.String("project", "", "selects the project to be used")
 	traceFlag   = flag.String("trace", "", "file to write trace to")
+	sortFlag    = flag.String("sort", "deployed", "how to sort the results")
 )
 
 func main() {
@@ -96,23 +110,47 @@ func getDrifts(ctx context.Context, c *gitlab.Client, pid int, envDeps []EnvDep)
 
 	var wg sync.WaitGroup
 
-	fmt.Printf("SERVICE           | SHORT SHA | LAST DEPLOY\n")
+	ch := make(chan Result, len(envDeps))
+
 	for _, envDep := range envDeps {
 		wg.Add(1)
 		go func(ed EnvDep) {
 			defer wg.Done()
 
-			if err := getDrift(ctx, c, pid, ed); err != nil {
+			if err := getDrift(ctx, c, pid, ed, ch); err != nil {
 				log.Printf("get drift %s: %v", ed.Name, err)
 			}
 		}(envDep)
 	}
 
 	wg.Wait()
+	close(ch)
+
+	// Collect answers
+	results := make([]Result, 0, len(envDeps))
+	for res := range ch {
+		results = append(results, res)
+	}
+
+	switch *sortFlag {
+	case "deployed":
+		sort.Sort(ByLastDeployed(results))
+	case "rev-deployed":
+		sort.Sort(sort.Reverse(ByLastDeployed(results)))
+	default:
+		log.Printf("didn't recognize sort flag: %s", *sortFlag)
+	}
+
+	fmt.Printf("SERVICE           | SHORT SHA | LAST DEPLOY\n")
+	for _, result := range results {
+		dd := durafmt.Parse(time.Since(result.deployed)).LimitFirstN(2)
+		fmt.Printf("%-18s| %s  | %s\n", result.name, result.sha, dd)
+	}
+
 	return nil
 }
 
-func getDrift(ctx context.Context, c *gitlab.Client, pid int, ed EnvDep) error {
+func getDrift(ctx context.Context, c *gitlab.Client, pid int, ed EnvDep, ch chan Result) error {
 	ctx, tsk := trace.NewTask(ctx, "get-drift")
 	defer tsk.End()
 
@@ -129,10 +167,11 @@ func getDrift(ctx context.Context, c *gitlab.Client, pid int, ed EnvDep) error {
 
 	pdep := penv.LastDeployment.Deployable
 
-	lastDep := time.Since(*pdep.FinishedAt)
-	dd := durafmt.Parse(lastDep).LimitFirstN(2)
-	fmt.Printf("%-18s| %s  | %s\n", ed.Name, pdep.Commit.ShortID, dd.String())
-
+	ch <- Result{
+		name:     ed.Name,
+		sha:      pdep.Commit.ShortID,
+		deployed: *pdep.FinishedAt,
+	}
 	return nil
 }
 
