@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"runtime/trace"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,15 @@ type EnvDep struct {
 	Name string
 	Prod int
 }
+
+type Result struct {
+	name       string
+	sha        string
+	deploy     string
+	deployTime int
+}
+
+type ByDate []Result
 
 var (
 	projectFlag = flag.String("project", "", "selects the project to be used")
@@ -96,23 +106,41 @@ func getDrifts(ctx context.Context, c *gitlab.Client, pid int, envDeps []EnvDep)
 
 	var wg sync.WaitGroup
 
+	var ch = make(chan Result, len(envDeps))
+
 	fmt.Printf("SERVICE           | SHORT SHA | LAST DEPLOY\n")
 	for _, envDep := range envDeps {
 		wg.Add(1)
 		go func(ed EnvDep) {
 			defer wg.Done()
 
-			if err := getDrift(ctx, c, pid, ed); err != nil {
+			if err := getDrift(ctx, c, pid, ed, ch); err != nil {
 				log.Printf("get drift %s: %v", ed.Name, err)
 			}
 		}(envDep)
 	}
 
 	wg.Wait()
+	close(ch)
+
+	results := make([]Result, len(envDeps))
+
+	for i := range results {
+		results[i] = <-ch
+	}
+
+	sort.Sort(ByDate(results))
+
+	for _, result := range results {
+		if result.name != "" {
+			fmt.Printf("%-18s| %s  | %s\n", result.name, result.sha, result.deploy)
+		}
+	}
+
 	return nil
 }
 
-func getDrift(ctx context.Context, c *gitlab.Client, pid int, ed EnvDep) error {
+func getDrift(ctx context.Context, c *gitlab.Client, pid int, ed EnvDep, ch chan Result) error {
 	ctx, tsk := trace.NewTask(ctx, "get-drift")
 	defer tsk.End()
 
@@ -131,8 +159,13 @@ func getDrift(ctx context.Context, c *gitlab.Client, pid int, ed EnvDep) error {
 
 	lastDep := time.Since(*pdep.FinishedAt)
 	dd := durafmt.Parse(lastDep).LimitFirstN(2)
-	fmt.Printf("%-18s| %s  | %s\n", ed.Name, pdep.Commit.ShortID, dd.String())
-
+	result := Result{
+		name:       ed.Name,
+		sha:        pdep.Commit.ShortID,
+		deploy:     dd.String(),
+		deployTime: int(dd.Duration()),
+	}
+	ch <- result
 	return nil
 }
 
@@ -203,3 +236,7 @@ func getProjectID(ctx context.Context, c *gitlab.Client) (int, error) {
 	p := ps[0]
 	return p.ID, nil
 }
+
+func (a ByDate) Len() int           { return len(a) }
+func (a ByDate) Less(i, j int) bool { return a[i].deployTime < a[j].deployTime }
+func (a ByDate) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
