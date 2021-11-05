@@ -106,8 +106,6 @@ func getDrifts(ctx context.Context, c *gitlab.Client, pid int, envDeps []EnvDep)
 				log.Printf("get drift %s: %v", ed.Name, err)
 			}
 		}(envDep)
-
-		// wg.Wait()
 	}
 
 	wg.Wait()
@@ -119,7 +117,7 @@ func getDrift(ctx context.Context, c *gitlab.Client, pid int, ed EnvDep) error {
 	defer tsk.End()
 
 	trace.Log(ctx, "service", ed.Name)
-	penv, r, err := c.Environments.GetEnvironment(pid, ed.Prod)
+	penv, r, err := c.Environments.GetEnvironment(pid, ed.Prod, gitlab.WithContext(ctx))
 	if err != nil {
 		return fmt.Errorf("get prod environment: %v", err)
 	}
@@ -155,7 +153,7 @@ func getEnvs(ctx context.Context, c *gitlab.Client, pid int) ([]EnvDep, error) {
 			},
 			States: gitlab.String("available"),
 			Search: gitlab.String("prod/"),
-		})
+		}, gitlab.WithContext(ctx))
 		if err != nil {
 			return nil, fmt.Errorf("list environments: %v", err)
 		}
@@ -189,7 +187,7 @@ func getProjectID(ctx context.Context, c *gitlab.Client) (int, error) {
 		SearchNamespaces: gitlab.Bool(true),
 		Search:           gitlab.String(*projectFlag),
 		Visibility:       gitlab.Visibility(gitlab.PrivateVisibility),
-	})
+	}, gitlab.WithContext(ctx))
 	if err != nil {
 		return 0, fmt.Errorf("listing projects: %v", err)
 	}
